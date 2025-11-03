@@ -170,11 +170,92 @@ __trapret:
 对于任何中断，__alltraps 中都需要保存所有寄存器。
 
 理由：由于在本实验的代码中仅有一个中断处理程序，`__alltraps`的值被存储在寄存器`stvec`中，无论发生任何中断或异常，都会跳转至`__alltraps`处执行，中断/异常可能在任何时刻打断正在运行的用户程序（例如时钟中断等），这些事件都会使当前 CPU 寄存器（x0–x31）中保存的重要上下文信息暂时中断。如果不完整地保存这些寄存器，待中断处理结束返回用户态时就无法把程序恢复到中断前的精确状态，程序可能崩溃、寄存器值错乱或行为异常。另一方面，`__alltraps`在保存现场后会` jal trap` 跳到C语言的`trap(struct trapframe *tf)`处理函数——C 编译器在函数体内会自由使用若干寄存器，若事先没有把这些寄存器的原值保全，`trap(struct trapframe *tf)`的执行就会破坏被中断程序的寄存器内容。为此，`SAVE_ALL`必须把所有通用寄存器和关键控制寄存器一并保存，保证：C 层处理函数可以安全使用寄存器而不影响被中断程序；在处理结束（通过 RESTORE_ALL 和 sret）时能够准确恢复 sstatus/sepc 等并把所有通用寄存器还原回中断前的值，从而完全恢复原程序的执行上下文。
+
 # 扩展练习 Challenge2：理解上下文切换机制 
+## 1.csrw sscratch, sp; csrrw s0, sscratch, x0 的操作与目的
+在trapentry.S中，csrw sscratch, sp; csrrw s0, sscratch, x0这一对指令序列，是一种在不污染任何通用寄存器的情况下，安全备份进入陷阱前原始栈指针sp的技术。其操作流程是，首先通过csrw指令将当前sp的值暂存入sscratch这一CSR中；紧接着，利用csrrw将sscratch的备份值读入s0寄存器，同时将sscratch清零。此举的核心目的在于，为后续SAVE_ALL宏中修改sp以开辟trapframe空间之前，预先将被中断上下文的sp值安全地转移出来，为最终存入trapframe做好准备，整个过程保持了通用寄存器的原始状态直至它们被逐一保存。
+## 2.保存 stval 和 scause 的意义
+SAVE_ALL宏中保存stval和scause，而在RESTORE_ALL中却不恢复它们，其根本原因在于这两类CSR所承载的信息性质不同。通用寄存器、sepc与sstatus共同构成了被中断程序的执行上下文，是其得以无缝恢复执行的必要状态，因此必须被完整地保存与恢复。相比之下，scause（陷阱原因）和stval（陷阱辅助值）则属于事件信息，它们的作用是向陷阱处理程序报告“发生了什么”以及“为什么发生”，本质上是传递给处理函数的参数。因此，store这些CSR的意义在于，将硬件提供的事件报告打包到trapframe结构体中，从而安全地传递给C语言编写的trap函数进行分析。一旦trap函数完成其使命，这些诊断信息便不再需要，恢复它们没有必要。
 
 # 扩展练习Challenge3：完善异常中断
 
 ## 1. 非法指令异常处理实现
+本次实验的核心任务之一是实现对非法指令异常的捕获与处理。其目标不仅在于识别并报告此类异常，更关键的是在处理后能够精确地跳过该非法指令，以确保内核能够恢复正常的执行流，而不是陷入无限的异常循环或直接崩溃。
+
+为触发此异常，我们首先在 kern_init 函数中通过内联汇编插入了一条指令。初次尝试使用了全零的32位字作为非法指令，即 asm volatile (".word 0x00000000");。同时，我们在 exception_handler 函数中添加了相应的处理逻辑，用于打印异常类型和触发异常的指令地址。然而，运行测试后，终端输出了一个意外的结果：非法指令异常被连续触发并处理了两次。
+```c
+cprintf("+++ 触发一条非法指令异常！ +++\n");
+asm volatile (".word 0x00000000"); 
+cprintf("+++ 非法指令已被处理，继续执行程序。 +++\n");
+```
+
+```
+// 终端输出的意外结果
+++ setup timer interrupts
++++ 触发一条非法指令异常！ +++
+Exception type: Illegal instruction
+Illegal instruction caught at 0xffffffffc02000a8
+Exception type: Illegal instruction
+Illegal instruction caught at 0xffffffffc02000aa
++++ 非法指令已被处理，继续执行程序。 +++
+```
+为了探究其根本原因，我们利用 GDB 调试工具对异常发生时的处理器状态进行了深入分析。当程序因第一次异常中断在 exception_handler 时，我们检查了 trapframe 中的 epc 值，并对该地址处的指令进行反汇编。GDB 的输出揭示了问题的关键：
+```
+(gdb) p/x tf->epc
+$1 = 0xffffffffc02000a8
+(gdb) x/2i tf->epc      
+   0xffffffffc02000a8 <kern_init+84>:   unimp
+   0xffffffffc02000aa <kern_init+86>:   unimp
+```
+GDB 的反汇编结果明确显示，位于 0xffffffffc02000a8 的4字节零值，**被处理器解释为了两条连续的、长度为2字节的非法指令**。通过与队友交流得知，这是由于我们实验环境中的 RISC-V 处理器支持'C'指令集扩展。根据其编码规则，指令的最低两位决定了其基本长度，0x0000 的最低两位为00，符合16位压缩指令的格式。因此，CPU在执行到 0xa8 地址时，取出前2字节并触发了第一次异常；在我们的处理函数将其 epc 增加2并返回后，CPU又继续执行 0xaa 处的后2字节，从而触发了第二次异常。
+
+基于这一发现，我们修正了触发方式，使用了一个能确保被识别为32位指令的编码 0xFFFFFFFF，因为其最低两位为11。同时，我们实现了更为健壮的异常处理代码，它能够在运行时通过检查指令编码的最低两位来动态判断其长度，无论是16位还是32位指令都能正确处理，从而保证 epc 总是被更新到正确的下一条指令地址。
+```c
+// 修正后的触发代码（kern/init/init.c）
+cprintf("+++ 触发一条非法指令异常！ +++\n");
+asm volatile (".word 0xFFFFFFFF"); 
+cprintf("+++ 非法指令已被处理，继续执行程序。 +++\n");
+
+// 最终实现的异常处理逻辑（kern/trap/trap.c）
+case CAUSE_ILLEGAL_INSTRUCTION:
+    cprintf("Exception type: Illegal instruction\n");
+    cprintf("Illegal instruction caught at 0x%016lx\n", tf->epc);
+
+    uint16_t instruction = *(uint16_t *)tf->epc;
+    if ((instruction & 0x3) != 0x3) // 16-bit 压缩指令
+        tf->epc += 2;
+    else // 32-bit 标准指令
+        tf->epc += 4;
+    break;
+```
+为最终验证实现的正确性，我们再次利用 GDB 设置了两个断点：一个在 exception_handler，另一个在非法指令之后的 cprintf 调用处。程序运行时，首先准确地命中了 exception_handler 断点；继续执行后，成功命中了第二个断点，而没有再次触发异常。
+```
+(gdb) break exception_handler
+Breakpoint 1 at 0xffffffffc0200b60: file kern/trap/trap.c, line 157.
+(gdb) break kern/init/init.c:42
+Breakpoint 2 at 0xffffffffc02000ac: file kern/init/init.c, line 42.
+(gdb) continue
+Continuing.
+
+Breakpoint 1, exception_handler (tf=0xffffffffc0205ed0) ...
+(gdb) continue
+Continuing.
+
+Breakpoint 2, kern_init () at kern/init/init.c:42
+42          cprintf("+++ 非法指令已被处理，继续执行程序。 +++\n");
+```
+最终的终端输出结果也清晰地证明了这一点，非法指令异常只被处理了一次，随后程序正常恢复执行。这一系列调试与修正过程，不仅完成了实验要求，也加深了我们对 RISC-V 指令集编码及异常处理精确性的理解。
+```c
+// 最终正确的终端输出
+++ setup timer interrupts
++++ 触发一条非法指令异常！ +++
+Exception type: Illegal instruction
+Illegal instruction caught at 0xffffffffc02000a8
++++ 非法指令已被处理，继续执行程序。 +++
+100 ticks
+QEMU: Terminated
+```
+
 
 ## 2. 断点异常处理实现
 
