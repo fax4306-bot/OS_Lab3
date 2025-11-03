@@ -230,7 +230,7 @@ void exception_handler(struct trapframe *tf) {
 
             // 功能 4: 健壮地恢复执行流。
             // 从 epc 指向的地址读取指令的前 16 位。
-            uint16_t instruction = *(uint16_t *)tf->epc;
+            instruction = *(uint16_t *)tf->epc;
             // 通过检查指令编码的最低两位来动态判断指令长度，以确保能正确跳过 ebreak 指令。
             if ((instruction & 0x3) != 0x3) {
                 // 这是一个 16-bit 的压缩指令。
@@ -283,4 +283,5 @@ void trap(struct trapframe *tf) {
     // dispatch based on what type of trap occurred
     trap_dispatch(tf);
 }
+
 
